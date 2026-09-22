@@ -819,13 +819,69 @@ static std::string GenerateBotGameStateSnapshot(Player* bot)
 }
 
 
-// --- Helper: item display name (+ stack count) ---
-static std::string ChatHandler_ItemName(Item* item)
+// --- Localization helpers: translate to the MASTER player's client language ---
+// (bots run in enUS, but the human is e.g. deDE - the server has the *_locale tables).
+static std::string LocalizeAreaName(AreaTableEntry const* a, int loc)
+{
+    if (!a) return "";
+    char const* s = a->area_name[loc];
+    std::string name = (s && *s) ? s : "";
+    if (name.empty()) { char const* e = a->area_name[LOCALE_enUS]; name = e ? e : ""; }
+    return name;
+}
+
+static std::string LocalizeCreatureName(uint32 entry, int loc, std::string const& fallback)
+{
+    std::string name = fallback;
+    if (CreatureLocale const* cl = sObjectMgr->GetCreatureLocale(entry))
+        ObjectMgr::GetLocaleString(cl->Name, loc, name);
+    return name;
+}
+
+// A Unit's display name in the master's language (creatures get localized, players keep their name)
+static std::string LocalizeUnitName(Unit* u, int loc)
+{
+    if (!u) return "niemand";
+    if (u->GetTypeId() == TYPEID_UNIT)
+        return LocalizeCreatureName(u->GetEntry(), loc, u->GetName());
+    return u->GetName();
+}
+
+// Holiday/festival name in the master's language. game_event has no locale table, so map the
+// main holidays by HolidayId for deDE; any other locale (or unknown holiday) keeps the English name.
+static std::string LocalizeHoliday(uint32 holidayId, int loc, std::string const& fallback)
+{
+    if (loc != LOCALE_deDE)
+        return fallback;
+    switch (holidayId)
+    {
+        case 341: return "Sonnenwendfest";              // Midsummer Fire Festival
+        case 141: return "Fest des Winterhauchs";       // Feast of Winter Veil
+        case 327: return "Mondfest";                    // Lunar Festival
+        case 423: return "Liebe liegt in der Luft";     // Love is in the Air
+        case 181: return "Nobelgarten";                 // Noblegarden
+        case 201: return "Kinderwoche";                 // Children's Week
+        case 321: return "Erntefest";                   // Harvest Festival
+        case 324: return "Schlotternaechte";            // Hallow's End
+        case 372: return "Braufest";                    // Brewfest
+        case 404: return "Pilgerfreuden";               // Pilgrim's Bounty
+        case 409: return "Tag der Toten";               // Day of the Dead
+        case 398: return "Piratentag";                  // Pirates' Day
+        case 374: case 375: case 376:
+                  return "Dunkelmond-Jahrmarkt";        // Darkmoon Faire
+        default:  return fallback;
+    }
+}
+
+// --- Helper: item display name in the master's language (+ stack count) ---
+static std::string ChatHandler_ItemName(Item* item, int loc)
 {
     if (!item) return "";
     ItemTemplate const* t = item->GetTemplate();
     if (!t) return "";
     std::string name = t->Name1;
+    if (ItemLocale const* il = sObjectMgr->GetItemLocale(item->GetEntry()))
+        ObjectMgr::GetLocaleString(il->Name, loc, name);
     uint32 count = item->GetCount();
     if (count > 1) name += " x" + std::to_string(count);
     return name;
@@ -833,7 +889,7 @@ static std::string ChatHandler_ItemName(Item* item)
 
 // --- Helper: party roster (gold, equipped gear, bag contents) as a list ---
 // PARTY only (max 5, same subgroup as the bot) - never a full raid, or the prompt explodes.
-static std::string ChatHandler_GetPartySnapshot(Player* bot)
+static std::string ChatHandler_GetPartySnapshot(Player* bot, int loc)
 {
     if (!bot) return "";
     Group* group = bot->GetGroup();
@@ -857,7 +913,7 @@ static std::string ChatHandler_GetPartySnapshot(Player* bot)
         std::string equipped;
         for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
         {
-            std::string n = ChatHandler_ItemName(m->GetItemByPos(INVENTORY_SLOT_BAG_0, slot));
+            std::string n = ChatHandler_ItemName(m->GetItemByPos(INVENTORY_SLOT_BAG_0, slot), loc);
             if (!n.empty()) { if (!equipped.empty()) equipped += ", "; equipped += n; }
         }
         oss << "  Angelegt: " << (equipped.empty() ? "nichts" : equipped) << "\n";
@@ -868,7 +924,7 @@ static std::string ChatHandler_GetPartySnapshot(Player* bot)
         auto addItem = [&](Item* it)
         {
             if (!it || cnt >= 30) return;
-            std::string n = ChatHandler_ItemName(it);
+            std::string n = ChatHandler_ItemName(it, loc);
             if (n.empty()) return;
             if (!inv.empty()) inv += ", ";
             inv += n;
@@ -1916,8 +1972,10 @@ std::string GenerateBotPrompt(Player* bot, std::string playerMessage, Player* pl
     std::string botName             = bot->GetName();
     uint32_t botLevel               = bot->GetLevel();
     uint8_t botGenderByte           = bot->getGender();
-    std::string botAreaName         = botCurrentArea ? botAI->GetLocalizedAreaName(botCurrentArea): "UnknownArea";
-    std::string botZoneName         = botCurrentZone ? botAI->GetLocalizedAreaName(botCurrentZone): "UnknownZone";
+    // The human player's client language (deDE etc.) - localize all names to THIS, not the bot's enUS.
+    int mLoc = (player->GetSession() ? (int)player->GetSession()->GetSessionDbLocaleIndex() : (int)LOCALE_enUS);
+    std::string botAreaName         = botCurrentArea ? LocalizeAreaName(botCurrentArea, mLoc): "UnknownArea";
+    std::string botZoneName         = botCurrentZone ? LocalizeAreaName(botCurrentZone, mLoc): "UnknownZone";
     std::string botMapName          = bot->GetMap() ? bot->GetMap()->GetMapName() : "UnknownMap";
     std::string botClass            = botAI->GetChatHelper()->FormatClass(bot->getClass());
     std::string botRace             = botAI->GetChatHelper()->FormatRace(bot->getRace());
@@ -1954,22 +2012,22 @@ std::string GenerateBotPrompt(Player* bot, std::string playerMessage, Player* pl
     // Who the bot (or a groupmate, if the bot itself has no target) is fighting
     std::string combatEnemy = "niemand";
     if (Unit* v = bot->GetVictim())
-        combatEnemy = v->GetName();
+        combatEnemy = LocalizeUnitName(v, mLoc);
     else if (Group* g = bot->GetGroup())
     {
         for (GroupReference* ref = g->GetFirstMember(); ref; ref = ref->next())
         {
             Player* m = ref->GetSource();
-            if (m && m->GetVictim()) { combatEnemy = m->GetVictim()->GetName(); break; }
+            if (m && m->GetVictim()) { combatEnemy = LocalizeUnitName(m->GetVictim(), mLoc); break; }
         }
     }
 
     // Who the player (group leader) is focusing / has targeted
     std::string focusTarget = "niemand";
     if (Unit* pv = player->GetVictim())
-        focusTarget = pv->GetName();
+        focusTarget = LocalizeUnitName(pv, mLoc);
     else if (Unit* sel = player->GetSelectedUnit())
-        focusTarget = sel->GetName();
+        focusTarget = LocalizeUnitName(sel, mLoc);
 
     // Active holiday/festival event(s) (real holidays only, not arena/BG internals)
     std::string activeEvent;
@@ -1980,7 +2038,7 @@ std::string GenerateBotPrompt(Player* bot, std::string playerMessage, Player* pl
             if (id < events.size() && events[id].HolidayId != HOLIDAY_NONE && !events[id].Description.empty())
             {
                 if (!activeEvent.empty()) activeEvent += ", ";
-                activeEvent += events[id].Description;
+                activeEvent += LocalizeHoliday(events[id].HolidayId, mLoc, events[id].Description);
             }
         if (activeEvent.empty()) activeEvent = "keins";
     }
@@ -1997,8 +2055,7 @@ std::string GenerateBotPrompt(Player* bot, std::string playerMessage, Player* pl
             std::string title = q->GetTitle();
             if (auto const* locale = sObjectMgr->GetQuestLocale(questId))
             {
-                int locIdx = bot->GetSession()->GetSessionDbLocaleIndex();
-                if (locIdx >= 0) ObjectMgr::GetLocaleString(locale->Title, locIdx, title);
+                if (mLoc >= 0) ObjectMgr::GetLocaleString(locale->Title, mLoc, title);
             }
             if (!activeQuests.empty()) activeQuests += "; ";
             activeQuests += title;
@@ -2019,7 +2076,7 @@ std::string GenerateBotPrompt(Player* bot, std::string playerMessage, Player* pl
                 if (!c || !c->IsAlive() || c->IsPet() || c->IsTotem()) continue;
                 if (!c->IsHostileTo(bot)) continue;
                 if (!bot->IsWithinDistInMap(c, 40.0f)) continue;
-                counts[c->GetName()]++;
+                counts[LocalizeCreatureName(c->GetEntry(), mLoc, c->GetName())]++;
             }
         for (auto const& [name, n] : counts)
         {
@@ -2030,7 +2087,7 @@ std::string GenerateBotPrompt(Player* bot, std::string playerMessage, Player* pl
     }
 
     // Party roster (gold, equipped, inventory) - PARTY only, never a full raid
-    std::string partyMembers = ChatHandler_GetPartySnapshot(bot);
+    std::string partyMembers = ChatHandler_GetPartySnapshot(bot, mLoc);
 
     // Retrieve RAG information if enabled
     std::string ragInfo;
