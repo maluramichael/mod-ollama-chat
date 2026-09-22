@@ -10,6 +10,7 @@
 #include <mutex>
 #include <queue>
 #include <future>
+#include <ctime>
 
 std::string ExtractTextBetweenDoubleQuotes(const std::string& response)
 {
@@ -118,8 +119,27 @@ std::string QueryOllamaAPI(const std::string& prompt)
     }
     if (!g_OllamaSystemPrompt.empty())
     {
+        // Inject the live server clock so bots know the real time. {current_time} (HH:MM) and
+        // {current_date} (YYYY-MM-DD) are replaced per request; a prompt that omits them is
+        // unaffected. (Zone is per-bot, so it is injected into the user prompt in the handler,
+        // not here - the API layer has no bot context.)
+        std::string sysPrompt = g_OllamaSystemPrompt;
+        std::time_t nowT = std::time(nullptr);
+        std::tm lt{};
+        localtime_s(&lt, &nowT);
+        char timeBuf[16] = {0};
+        char dateBuf[16] = {0};
+        std::strftime(timeBuf, sizeof(timeBuf), "%H:%M", &lt);
+        std::strftime(dateBuf, sizeof(dateBuf), "%Y-%m-%d", &lt);
+        auto replaceAll = [](std::string& s, const std::string& from, const std::string& to) {
+            if (from.empty()) return;
+            for (size_t p = s.find(from); p != std::string::npos; p = s.find(from, p + to.size()))
+                s.replace(p, from.size(), to);
+        };
+        replaceAll(sysPrompt, "{current_time}", timeBuf);
+        replaceAll(sysPrompt, "{current_date}", dateBuf);
         // Sanitize system prompt as well
-        requestData["system"] = SanitizeUTF8(g_OllamaSystemPrompt);
+        requestData["system"] = SanitizeUTF8(sysPrompt);
     }
 
     if (g_ThinkModeEnableForModule)

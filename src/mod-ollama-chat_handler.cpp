@@ -1906,7 +1906,11 @@ std::string GenerateBotPrompt(Player* bot, std::string playerMessage, Player* pl
         fmt::arg("player_message", playerMessage),
         fmt::arg("extra_info", extraInfo),
         fmt::arg("chat_history", chatHistory),
-        fmt::arg("sentiment_info", sentimentInfo)
+        fmt::arg("sentiment_info", sentimentInfo),
+        // Live location so reactive replies can reference where the bot actually is.
+        fmt::arg("bot_area", botAreaName),
+        fmt::arg("bot_zone", botZoneName),
+        fmt::arg("bot_map", botMapName)
     );
 
     // Add RAG information to the prompt if available
