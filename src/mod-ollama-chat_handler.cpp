@@ -38,6 +38,11 @@
 #include "Group.h"
 #include "Creature.h"
 #include "GameObject.h"
+#include "GameEventMgr.h"
+#include "Item.h"
+#include "Bag.h"
+#include "ItemTemplate.h"
+#include <map>
 #include "TravelMgr.h"
 #include "TravelNode.h"
 #include "ObjectMgr.h"
@@ -811,6 +816,91 @@ static std::string GenerateBotGameStateSnapshot(Player* bot)
         fmt::arg("los", los),
         fmt::arg("players", players)
     );
+}
+
+
+// --- Helper: item display name (+ stack count) ---
+static std::string ChatHandler_ItemName(Item* item)
+{
+    if (!item) return "";
+    ItemTemplate const* t = item->GetTemplate();
+    if (!t) return "";
+    std::string name = t->Name1;
+    uint32 count = item->GetCount();
+    if (count > 1) name += " x" + std::to_string(count);
+    return name;
+}
+
+// --- Helper: party roster (gold, equipped gear, bag contents) as a list ---
+// PARTY only (max 5, same subgroup as the bot) - never a full raid, or the prompt explodes.
+static std::string ChatHandler_GetPartySnapshot(Player* bot)
+{
+    if (!bot) return "";
+    Group* group = bot->GetGroup();
+    std::ostringstream oss;
+
+    auto describeMember = [&](Player* m)
+    {
+        if (!m) return;
+        uint32 maxHp  = m->GetMaxHealth();
+        uint32 hpPct  = maxHp ? (uint32)(m->GetHealth() * 100 / maxHp) : 0;
+        std::string manaStr = "-";
+        if (m->GetMaxPower(POWER_MANA) > 0)
+            manaStr = std::to_string(m->GetPower(POWER_MANA) * 100 / m->GetMaxPower(POWER_MANA)) + "%";
+
+        oss << "- " << m->GetName()
+            << " (Lvl " << (uint32)m->GetLevel() << " " << FormatPlayerClass(m->getClass())
+            << ", HP " << hpPct << "%, Mana " << manaStr
+            << ", Gold " << (m->GetMoney() / 10000) << "g)\n";
+
+        // Equipped gear
+        std::string equipped;
+        for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
+        {
+            std::string n = ChatHandler_ItemName(m->GetItemByPos(INVENTORY_SLOT_BAG_0, slot));
+            if (!n.empty()) { if (!equipped.empty()) equipped += ", "; equipped += n; }
+        }
+        oss << "  Angelegt: " << (equipped.empty() ? "nichts" : equipped) << "\n";
+
+        // Bag contents (backpack + bags), capped at 30 items per member
+        std::string inv;
+        int cnt = 0;
+        auto addItem = [&](Item* it)
+        {
+            if (!it || cnt >= 30) return;
+            std::string n = ChatHandler_ItemName(it);
+            if (n.empty()) return;
+            if (!inv.empty()) inv += ", ";
+            inv += n;
+            ++cnt;
+        };
+        for (uint8 slot = INVENTORY_SLOT_ITEM_START; slot < INVENTORY_SLOT_ITEM_END; ++slot)
+            addItem(m->GetItemByPos(INVENTORY_SLOT_BAG_0, slot));
+        for (uint8 bag = INVENTORY_SLOT_BAG_START; bag < INVENTORY_SLOT_BAG_END; ++bag)
+            for (uint8 j = 0; j < 36; ++j)
+                addItem(m->GetItemByPos(bag, j));
+        oss << "  Inventar: " << (inv.empty() ? "leer" : inv) << "\n";
+    };
+
+    if (!group)
+    {
+        describeMember(bot);
+        return oss.str();
+    }
+
+    // Limit to the bot's own party (subgroup) and hard-cap at 5, so a raid never
+    // balloons the prompt with 40 members' full inventories.
+    uint8 botSubGroup = group->GetMemberGroup(bot->GetGUID());
+    int listed = 0;
+    for (GroupReference* ref = group->GetFirstMember(); ref && listed < 5; ref = ref->next())
+    {
+        Player* m = ref->GetSource();
+        if (!m) continue;
+        if (group->isRaidGroup() && group->GetMemberGroup(m->GetGUID()) != botSubGroup) continue;
+        describeMember(m);
+        ++listed;
+    }
+    return oss.str();
 }
 
 
@@ -1854,6 +1944,94 @@ std::string GenerateBotPrompt(Player* bot, std::string playerMessage, Player* pl
     std::string chatHistory         = GetBotHistoryPrompt(botGuid, playerGuid, playerMessage);
     std::string sentimentInfo       = GetSentimentPromptAddition(bot, player);
 
+    // --- Live combat/awareness context for the reactive prompt ---
+    uint32 botMaxHp = bot->GetMaxHealth();
+    std::string botHealth = std::to_string(botMaxHp ? (uint32)(bot->GetHealth() * 100 / botMaxHp) : 0) + "%";
+    std::string botMana = "-";
+    if (bot->GetMaxPower(POWER_MANA) > 0)
+        botMana = std::to_string(bot->GetPower(POWER_MANA) * 100 / bot->GetMaxPower(POWER_MANA)) + "%";
+
+    // Who the bot (or a groupmate, if the bot itself has no target) is fighting
+    std::string combatEnemy = "niemand";
+    if (Unit* v = bot->GetVictim())
+        combatEnemy = v->GetName();
+    else if (Group* g = bot->GetGroup())
+    {
+        for (GroupReference* ref = g->GetFirstMember(); ref; ref = ref->next())
+        {
+            Player* m = ref->GetSource();
+            if (m && m->GetVictim()) { combatEnemy = m->GetVictim()->GetName(); break; }
+        }
+    }
+
+    // Who the player (group leader) is focusing / has targeted
+    std::string focusTarget = "niemand";
+    if (Unit* pv = player->GetVictim())
+        focusTarget = pv->GetName();
+    else if (Unit* sel = player->GetSelectedUnit())
+        focusTarget = sel->GetName();
+
+    // Active holiday/festival event(s) (real holidays only, not arena/BG internals)
+    std::string activeEvent;
+    {
+        GameEventMgr::ActiveEvents const& active = sGameEventMgr->GetActiveEventList();
+        GameEventMgr::GameEventDataMap const& events = sGameEventMgr->GetEventMap();
+        for (uint16 id : active)
+            if (id < events.size() && events[id].HolidayId != HOLIDAY_NONE && !events[id].Description.empty())
+            {
+                if (!activeEvent.empty()) activeEvent += ", ";
+                activeEvent += events[id].Description;
+            }
+        if (activeEvent.empty()) activeEvent = "keins";
+    }
+
+    // Bot's active quests (in progress / ready to hand in), capped at 5
+    std::string activeQuests;
+    {
+        int qc = 0;
+        for (auto const& [questId, qsd] : bot->getQuestStatusMap())
+        {
+            if (qsd.Status != QUEST_STATUS_INCOMPLETE && qsd.Status != QUEST_STATUS_COMPLETE) continue;
+            Quest const* q = sObjectMgr->GetQuestTemplate(questId);
+            if (!q) continue;
+            std::string title = q->GetTitle();
+            if (auto const* locale = sObjectMgr->GetQuestLocale(questId))
+            {
+                int locIdx = bot->GetSession()->GetSessionDbLocaleIndex();
+                if (locIdx >= 0) ObjectMgr::GetLocaleString(locale->Title, locIdx, title);
+            }
+            if (!activeQuests.empty()) activeQuests += "; ";
+            activeQuests += title;
+            if (qsd.Status == QUEST_STATUS_COMPLETE) activeQuests += " (fertig)";
+            if (++qc >= 5) break;
+        }
+        if (activeQuests.empty()) activeQuests = "keine";
+    }
+
+    // Nearby hostile creatures within 40y, deduplicated with counts (e.g. "3x Kobold")
+    std::string nearbyEnemies;
+    {
+        std::map<std::string, int> counts;
+        if (bot->GetMap())
+            for (auto const& pair : bot->GetMap()->GetCreatureBySpawnIdStore())
+            {
+                Creature* c = pair.second;
+                if (!c || !c->IsAlive() || c->IsPet() || c->IsTotem()) continue;
+                if (!c->IsHostileTo(bot)) continue;
+                if (!bot->IsWithinDistInMap(c, 40.0f)) continue;
+                counts[c->GetName()]++;
+            }
+        for (auto const& [name, n] : counts)
+        {
+            if (!nearbyEnemies.empty()) nearbyEnemies += ", ";
+            nearbyEnemies += (n > 1 ? std::to_string(n) + "x " + name : name);
+        }
+        if (nearbyEnemies.empty()) nearbyEnemies = "keine";
+    }
+
+    // Party roster (gold, equipped, inventory) - PARTY only, never a full raid
+    std::string partyMembers = ChatHandler_GetPartySnapshot(bot);
+
     // Retrieve RAG information if enabled
     std::string ragInfo;
     if (g_EnableRAG && g_RAGSystem) {
@@ -1910,7 +2088,16 @@ std::string GenerateBotPrompt(Player* bot, std::string playerMessage, Player* pl
         // Live location so reactive replies can reference where the bot actually is.
         fmt::arg("bot_area", botAreaName),
         fmt::arg("bot_zone", botZoneName),
-        fmt::arg("bot_map", botMapName)
+        fmt::arg("bot_map", botMapName),
+        // Live combat/awareness context.
+        fmt::arg("bot_health", botHealth),
+        fmt::arg("bot_mana", botMana),
+        fmt::arg("combat_enemy", combatEnemy),
+        fmt::arg("focus_target", focusTarget),
+        fmt::arg("nearby_enemies", nearbyEnemies),
+        fmt::arg("active_event", activeEvent),
+        fmt::arg("active_quests", activeQuests),
+        fmt::arg("party_members", partyMembers)
     );
 
     // Add RAG information to the prompt if available
